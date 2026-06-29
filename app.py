@@ -17,10 +17,11 @@ except Exception:
     get_api_key = None
 
 try:
-    from services.excel_service import dataframe_to_excel_bytes, preserve_style_export
+    from services.excel_service import dataframe_to_excel_bytes, preserve_style_export, read_excel
 except Exception:
     dataframe_to_excel_bytes = None
     preserve_style_export = None
+    read_excel = None
 
 st.set_page_config(page_title="DataTalk AI", page_icon="📊", layout="wide")
 
@@ -67,6 +68,7 @@ def init():
         "file_name": None,
         "file2_name": None,
         "original_file_bytes": None,
+        "excel_meta": None,
         "messages": [{"role": "assistant", "content": WELCOME}],
         "downloads": [],
         "last_result": None,
@@ -410,22 +412,61 @@ def reply_done(lines, rows=None):
     return f"{first}\n\n{body}"
 
 
+
+def _to_number_if_possible(value):
+    try:
+        if value is None or value == "":
+            return value
+        return float(str(value).replace(",", ""))
+    except Exception:
+        return value
+
+
+def build_condition_mask(df, column, operator, value=""):
+    s = df[column]
+    op = str(operator or "contains")
+    if op in ["blank"]:
+        return s.isna() | (s.astype(str).str.strip() == "")
+    if op in ["not_blank"]:
+        return ~(s.isna() | (s.astype(str).str.strip() == ""))
+    if op in ["gt", "gte", "lt", "lte"]:
+        num = pd.to_numeric(s, errors="coerce")
+        v = _to_number_if_possible(value)
+        try:
+            if op == "gt":
+                return num > float(v)
+            if op == "gte":
+                return num >= float(v)
+            if op == "lt":
+                return num < float(v)
+            if op == "lte":
+                return num <= float(v)
+        except Exception:
+            return pd.Series(False, index=df.index)
+    text_s = s.fillna("").astype(str)
+    val = str(value)
+    if op == "equals":
+        return text_s.str.strip().str.lower() == val.strip().lower()
+    if op == "not_equals":
+        return text_s.str.strip().str.lower() != val.strip().lower()
+    if op == "not_contains":
+        return ~text_s.str.contains(val, case=False, na=False, regex=False)
+    return text_s.str.contains(val, case=False, na=False, regex=False)
+
+
 def execute_ops(text):
-    # 預設從「原始 Excel」重新查，避免每次搜尋都疊在上一次的篩選結果上。
-    # 若使用者說「再、接著、目前、剛剛、這些」或勾選接續模式，才從目前工作結果繼續做。
     continue_words = ["再", "接著", "然後", "目前", "剛剛", "這些", "篩選結果", "上一步結果"]
     should_continue = st.session_state.get("use_working_source", False) or any(w in str(text) for w in continue_words)
     df = active_df() if should_continue else original_df()
     if df is None:
         return "請先到「上傳資料」上傳 Excel，或下載測試 Excel 後再上傳。", None
 
-    # Gemini 有設定時先用 AI 解析自然語言；失敗就自動退回本機規則，避免部署後不能用。
     ai_ops = None
     if parse_user_ops is not None:
         ai_ops = parse_user_ops(text, df)
     ops = ai_ops if ai_ops else detect_operations(text, df)
     if not ops:
-        return "我還沒抓到明確操作。你可以說：把供應商是華新工程的資料建一個 Excel，或：把備註不是正常的資料下載。", None
+        return "我還沒抓到明確操作。你可以直接說：搜尋某個值、統計某欄、把某欄不是正常的資料匯出、修改某欄、保留指定欄位。", None
 
     current = df.copy()
     lines = []
@@ -434,7 +475,14 @@ def execute_ops(text):
     chart = None
 
     for op in ops:
-        typ = op["type"]
+        typ = op.get("type")
+        if typ == "ask_clarify":
+            return "我需要你補充一下：" + str(op.get("question", "請指定要操作的欄位或條件。")), current
+        if typ == "summarize":
+            missing = int(current.isna().sum().sum())
+            dup = int(current.duplicated().sum())
+            lines.append(f"這份資料目前有 **{len(current)} 筆**、**{len(current.columns)} 欄**；空白值 **{missing}** 個、重複列 **{dup}** 筆。")
+            continue
         if typ == "undo":
             if not st.session_state.history:
                 return "目前沒有可以復原的上一步。", current
@@ -453,58 +501,137 @@ def execute_ops(text):
             return "↪️ 已重做下一步。", st.session_state.working_df
         if typ == "need_column":
             st.session_state.last_filter_value = op["value"]
-            return f"我找到「{op['value']}」可能在多個欄位：{', '.join(map(str, op['hits']))}。請再補一句欄位，例如：供應商。", None
+            return f"我找到「{op['value']}」可能在多個欄位：{', '.join(map(str, op['hits']))}。請再補一句欄位。", None
         if typ == "filter":
+            col = op.get("column")
+            if col not in current.columns:
+                lines.append(f"略過篩選：找不到欄位 {col}。")
+                continue
             before = len(current)
-            current = filter_dataframe(current, op["column"], op["value"], op["negative"])
-            st.session_state.last_filter_column = op["column"]
-            st.session_state.last_filter_value = op["value"]
-            op_word = "不包含" if op["negative"] else "包含"
-            if op.get("correction"):
-                lines.append(f"我猜你要找的是 **{op['value']}**（你輸入的是「{op['correction']}」）。")
-            lines.append(f"已篩選：**{op['column']} {op_word}「{op['value']}」**，{before} 筆 → {len(current)} 筆。")
-            filename_parts.append(f"{op['column']}_{'非' if op['negative'] else ''}{op['value']}")
+            operator = op.get("operator") or ("not_contains" if op.get("negative") else "contains")
+            value = op.get("value", "")
+            mask = build_condition_mask(current, col, operator, value)
+            current = current[mask].copy()
+            st.session_state.last_filter_column = col
+            st.session_state.last_filter_value = value
+            op_word = {
+                "contains":"包含", "not_contains":"不包含", "equals":"等於", "not_equals":"不等於",
+                "gt":"大於", "gte":"大於等於", "lt":"小於", "lte":"小於等於", "blank":"空白", "not_blank":"非空白"
+            }.get(operator, operator)
+            show_value = f"「{value}」" if str(value) else ""
+            lines.append(f"已篩選：**{col} {op_word}{show_value}**，{before} 筆 → {len(current)} 筆。")
+            filename_parts.append(f"{col}_{op_word}{value}")
             export_needed = export_needed or wants_export(text)
         elif typ == "search":
+            value = str(op.get("value", ""))
             mask = pd.Series(False, index=current.index)
             for c in current.columns:
-                mask |= current[c].fillna("").astype(str).str.contains(op["value"], case=False, na=False, regex=False)
+                mask |= current[c].fillna("").astype(str).str.contains(value, case=False, na=False, regex=False)
+            before = len(current)
             current = current[mask].copy()
-            lines.append(f"已全表搜尋：**{op['value']}**。")
-            filename_parts.append(f"搜尋_{op['value']}")
+            lines.append(f"已全表搜尋：**{value}**，{before} 筆 → {len(current)} 筆。")
+            filename_parts.append(f"搜尋_{value}")
             export_needed = True
         elif typ == "abnormal":
-            candidate_cols = [c for c in current.columns if any(k in str(c) for k in ["狀態", "結果", "備註", "問題", "異常", "說明"])]
-            if not candidate_cols:
-                return "找不到可判斷異常的欄位。建議至少要有「狀態」或「備註」欄位。", current
+            # fallback only: Gemini normally decides columns/values. This searches whole table for common abnormal words.
             mask = pd.Series(False, index=current.index)
-            for c in candidate_cols:
+            for c in current.columns:
                 mask |= current[c].fillna("").astype(str).str.contains(ABNORMAL_PATTERN, case=False, na=False, regex=True)
             current = current[mask].copy()
-            lines.append(f"已整理異常資料，判斷欄位：{', '.join(map(str, candidate_cols))}。")
+            lines.append("已依常見異常關鍵字做全表搜尋。")
             filename_parts.append("異常資料")
             export_needed = True
         elif typ == "count":
-            out = current[op["column"]].fillna("空白").astype(str).value_counts().reset_index()
-            out.columns = [op["column"], "數量"]
+            col = op.get("column")
+            if col not in current.columns:
+                continue
+            out = current[col].fillna("空白").astype(str).value_counts().reset_index()
+            out.columns = [col, "數量"]
             current = out
-            chart = (out, op["column"])
-            lines.append(f"已統計：**{op['column']}**，共 {len(out)} 種分類。")
-            filename_parts.append(f"{op['column']}_統計")
+            chart = (out, col)
+            lines.append(f"已統計：**{col}**，共 {len(out)} 種分類。")
+            filename_parts.append(f"{col}_統計")
+            export_needed = True
+        elif typ == "groupby":
+            by = op.get("by")
+            target = op.get("target")
+            agg = op.get("agg", "count")
+            if by not in current.columns:
+                continue
+            if agg == "count" or not target or target not in current.columns:
+                out = current.groupby(by, dropna=False).size().reset_index(name="數量")
+            else:
+                nums = pd.to_numeric(current[target], errors="coerce")
+                temp = current.copy(); temp[target] = nums
+                out = getattr(temp.groupby(by, dropna=False)[target], agg)().reset_index(name=f"{target}_{agg}")
+            current = out
+            chart = (out, by)
+            lines.append(f"已依 **{by}** 彙整（{agg}）。")
+            filename_parts.append(f"依{by}彙整")
             export_needed = True
         elif typ == "sort":
-            current = current.sort_values(by=op["column"], ascending=not op["descending"]).copy()
-            lines.append(f"已依照 **{op['column']}** {'由大到小' if op['descending'] else '由小到大'}排序。")
-            filename_parts.append(f"依{op['column']}排序")
+            col = op.get("column")
+            if col not in current.columns:
+                continue
+            current = current.sort_values(by=col, ascending=not bool(op.get("descending", False))).copy()
+            lines.append(f"已依照 **{col}** {'由大到小' if op.get('descending') else '由小到大'}排序。")
+            filename_parts.append(f"依{col}排序")
+        elif typ == "keep_columns":
+            cols = [c for c in op.get("columns", []) if c in current.columns]
+            if cols:
+                current = current[cols].copy()
+                lines.append(f"已保留欄位：{', '.join(cols)}。")
+                filename_parts.append("保留指定欄位")
+                export_needed = True
+        elif typ == "drop_columns":
+            cols = [c for c in op.get("columns", []) if c in current.columns]
+            if cols:
+                current = current.drop(columns=cols).copy()
+                lines.append(f"已刪除欄位：{', '.join(cols)}。")
+                filename_parts.append("刪除欄位")
+                export_needed = True
+        elif typ == "rename_column":
+            old, new = op.get("old"), op.get("new")
+            if old in current.columns and new:
+                current = current.rename(columns={old: new}).copy()
+                lines.append(f"已將欄位 **{old}** 改名為 **{new}**。")
+                filename_parts.append("欄位改名")
+                export_needed = True
         elif typ == "fill_blank":
-            current = current.fillna(op["value"])
-            lines.append(f"已把空白值補成 **{op['value']}**。")
+            col = op.get("column", "")
+            value = op.get("value", "")
+            if col and col in current.columns:
+                current[col] = current[col].fillna(value).replace("", value)
+                lines.append(f"已把 **{col}** 的空白值補成 **{value}**。")
+            else:
+                current = current.fillna(value).replace("", value)
+                lines.append(f"已把所有空白值補成 **{value}**。")
             filename_parts.append("空白值已補")
             export_needed = True
         elif typ == "add_column":
-            current[op["column"]] = op["value"]
-            lines.append(f"已新增欄位 **{op['column']}**，預設值為「{op['value']}」。")
-            filename_parts.append(f"新增{op['column']}")
+            col = op.get("column")
+            value = op.get("value", "")
+            if col:
+                current[col] = value
+                lines.append(f"已新增欄位 **{col}**，內容為「{value}」。")
+                filename_parts.append(f"新增{col}")
+                export_needed = True
+        elif typ == "update_cells":
+            where_col = op.get("where_column")
+            target_col = op.get("target_column")
+            if where_col in current.columns and target_col in current.columns:
+                mask = build_condition_mask(current, where_col, op.get("operator", "contains"), op.get("where_value", ""))
+                count = int(mask.sum())
+                current.loc[mask, target_col] = op.get("new_value", "")
+                lines.append(f"已更新 **{count}** 筆：符合 **{where_col}** 條件的資料，將 **{target_col}** 改為「{op.get('new_value', '')}」。")
+                filename_parts.append("資料已更新")
+                export_needed = True
+        elif typ == "remove_duplicates":
+            cols = [c for c in op.get("columns", []) if c in current.columns]
+            before = len(current)
+            current = current.drop_duplicates(subset=cols if cols else None).copy()
+            lines.append(f"已移除重複資料：{before} 筆 → {len(current)} 筆。")
+            filename_parts.append("移除重複")
             export_needed = True
         elif typ == "export":
             export_needed = True
@@ -522,8 +649,7 @@ def execute_ops(text):
 
     if export_needed:
         base = "_".join(filename_parts) if filename_parts else "DataTalk_整理結果"
-        if len(current) >= 0:
-            base = f"{base}_{len(current)}筆"
+        base = f"{base}_{len(current)}筆"
         item = add_download(current, f"{base}.xlsx", operation)
         lines.append(f"已建立新的 Excel：**{item['name']}**。")
 
@@ -597,26 +723,35 @@ if page == "上傳資料":
     st.divider()
     f = st.file_uploader("上傳主要 Excel", type=["xlsx", "xls"])
     if f:
-        data = f.getvalue()
-        df = pd.read_excel(io.BytesIO(data))
+        if read_excel is not None:
+            df, data, meta = read_excel(f)
+        else:
+            data = f.getvalue()
+            df = pd.read_excel(io.BytesIO(data))
+            meta = {"sheet": None, "header_row": 1, "all_sheets": []}
         st.session_state.df = df.copy()
         st.session_state.working_df = df.copy()
         st.session_state.last_result = df.copy()
         st.session_state.original_file_bytes = data
+        st.session_state.excel_meta = meta
         st.session_state.file_name = decode_hash_unicode(f.name)
         st.session_state.history.clear()
         st.session_state.redo_stack.clear()
-        st.success(f"已載入 {f.name}")
+        info = f"已載入 {f.name}：{len(df)} 筆 / {len(df.columns)} 欄"
+        if meta and meta.get("sheet"):
+            info += f"；自動選擇工作表「{meta.get('sheet')}」、表頭第 {meta.get('header_row')} 列"
+        st.success(info)
+        st.caption("系統會自動偵測表頭與欄位，不再綁死供應商/備註/狀態這種固定格式。")
     if active_df() is not None:
         st.caption("目前顯示的是工作資料；按左側「回到原始資料」可恢復原始 Excel。")
         st.dataframe(active_df().head(100), use_container_width=True)
 
 elif page == "AI 聊天執行":
-    render_header("AI 聊天執行", "直接說需求，系統會判斷意圖並執行 Excel 操作。")
+    render_header("AI 聊天執行", "直接說需求，Gemini 會依照你上傳的實際欄位與內容判斷並執行 Excel 操作。")
     st.markdown("""
     <div class='chat-hint'>
     <b>可直接輸入：</b><br>
-    把供應商是華新工程的資料建一個 Excel｜把備註不是正常的資料下載｜搜尋異常｜統計狀態｜把華新工程抓出來，再依日期排序，匯出 Excel｜undo / redo
+    找出某公司資料｜把某欄不是正常的資料下載｜統計任一欄位｜新增/刪除/改名欄位｜修改符合條件的資料｜依任一欄彙整｜undo / redo
     </div>
     """, unsafe_allow_html=True)
 
@@ -680,9 +815,15 @@ elif page == "資料關聯":
     else:
         f2 = st.file_uploader("上傳第二份 Excel", type=["xlsx", "xls"])
         if f2:
-            df2 = pd.read_excel(f2)
+            if read_excel is not None:
+                df2, _, meta2 = read_excel(f2)
+            else:
+                df2 = pd.read_excel(f2)
+                meta2 = {}
             st.session_state.df2 = df2
             st.session_state.file2_name = f2.name
+            if meta2.get("sheet"):
+                st.caption(f"第二份 Excel 自動選擇工作表「{meta2.get('sheet')}」、表頭第 {meta2.get('header_row')} 列。")
         if st.session_state.df2 is not None:
             df2 = st.session_state.df2
             common = [c for c in df.columns if c in df2.columns]

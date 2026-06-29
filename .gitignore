@@ -1,23 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyc
-
-# Virtual Environment
 venv/
-.venv/
-env/
-
-# Streamlit
+__pycache__/
+*.pyc
 .streamlit/secrets.toml
-
-# Excel exports
-exports/
 exports/*.xlsx
-
-# VS Code
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db

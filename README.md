@@ -50,3 +50,18 @@ Streamlit Cloud 部署時，請到：
 貼上同樣的 TOML 設定後重新 Deploy。
 
 程式會優先使用 Gemini 解析自然語言；如果 Gemini Key 無效或額度不足，仍會自動退回本機 Excel Agent 規則，不會整個壞掉。
+
+## v3 通用 Excel Agent 更新
+
+這版不再假設固定欄位，例如「供應商、備註、狀態」。
+
+- 上傳 Excel 時會自動偵測表頭列與工作表
+- Gemini 會根據實際 columns、sample rows、value counts 判斷使用者要操作哪個欄位
+- 支援篩選、搜尋、排序、統計、彙整、新增欄位、刪除欄位、欄位改名、修改符合條件的資料、填補空白、移除重複、匯出 Excel
+- 沒設定 Gemini 時仍保留基本本機 fallback，但通用判斷主要依賴 Gemini
+
+部署到 Streamlit Cloud 時，請在 Secrets 放：
+
+```toml
+GEMINI_API_KEY = "你的 Gemini API Key"
+```
